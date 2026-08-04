@@ -1,41 +1,42 @@
 #ifndef ASYNC_PIPELINE_CUH
 #define ASYNC_PIPELINE_CUH
 
-#include "common.h"
+#include <common.h>
+
 
 namespace pipeline {
 
-// 封装 Inline PTX 指令：执行 16 字节从 Global Memory 到 Shared Memory 的硬件级异步拷贝
-__device__ __forceinline__ void cp_async_16bytes(void* smem_ptr, const void* gmem_ptr, bool predicate) {
-    unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
-    
-    // 如果 predicate 为 true（未越界），执行 cp.async；否则填充 0，保证安全性
+// 1. 手写 Inline PTX 汇编：异步 16 字节 (128-bit) 搬运并带边界 Guard
+__device__ __forceinline__ void cp_async_16bytes(void* smem_ptr, const void* gmem_ptr, bool src_valid) {
+    unsigned int smem_addr = __cvta_generic_to_shared(smem_ptr);
+    // 使用 PTX 指令 cp.async.ca 进行 16 字节异步拷贝，当 src_valid 为 false 时自动补 0（避免越界）
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %2, 0;\n"
-        "  @p cp.async.cg.shared.global [%0], [%1], 16;\n"
-        "  @!p st.shared.b128 [%0], {0, 0, 0, 0};\n"
+        "  @p cp.async.ca.shared.global [%0], [%1], 16;\n"
         "}\n"
-        :
-        : "r"(smem_addr), "l"(gmem_ptr), "r"((int)predicate)
+        : 
+        : "r"(smem_addr), "l"(gmem_ptr), "r"((int)src_valid)
+        : "memory"
     );
 }
 
-// 提交当前异步拷贝组（相当于告诉硬件 DMA：“这批任务下发完毕”）
+// 2. 提交当前异步拷贝任务为一个 Group
 __device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.commit_group;\n" :: : "memory");
 }
 
-// 阻塞等待，直到后台只剩下最多 N 组异步拷贝还在进行
+// 3. 阻塞等待，直到未完成的 Group 数量 <= N
 template <int N>
 __device__ __forceinline__ void cp_async_wait_pending() {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
 }
 
 } // namespace pipeline
 
-// 对外暴露的测试 Kernel 声明
-void launch_async_copy_test(const float* d_in, float* d_out, int M, int N, cudaStream_t stream);
+// Launch 声明
+void launch_async_pipeline_gemm_stage(const float* d_A, const float* d_B, float* d_C,
+                                     int M, int N, int K, cudaStream_t stream = 0);
 
 #endif // ASYNC_PIPELINE_CUH
