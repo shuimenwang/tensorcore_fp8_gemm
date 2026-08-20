@@ -18,11 +18,14 @@ __global__ void async_double_buffer_pipeline_kernel(
     int tx = threadIdx.x; // 0..31
     int ty = threadIdx.y; // 0..31
 
+    // 🌟【关键新增】：拿到当前 Block 内拍平的 1D 线程 ID (0 .. 1023)
+    int tid = ty * blockDim.x + tx; 
+
     // 当前 Block 负责的全局矩阵 C 的 Tile 锚点
     int block_row = blockIdx.y * TILE_M;
     int block_col = blockIdx.x * TILE_N;
 
-    // 当前线程对应的全局坐标与 Guardian
+    // 当前线程用于最后 C 矩阵计算与写回的全局坐标
     int global_a_row = block_row + ty;
     int global_b_col = block_col + tx;
 
@@ -36,19 +39,46 @@ __global__ void async_double_buffer_pipeline_kernel(
     int write_stage = 0;
 
     // =========================================================================
+    // 🌟【核心助手 Lambda 函数】：16 字节完全对齐的 Shared Memory 搬运逻辑
+    // =========================================================================
+    auto load_gmem_to_smem_async = [&](int stage, int k_tile_offset) {
+        // --- 1. 搬运 A 矩阵 (TILE_M * TILE_K = 1024 个 float = 256 个 16-byte 块) ---
+        // 前 256 个线程 (tid < 256) 专职搬运 A，每个线程搬运 4 个 float
+        if (tid < 256) {
+            int a_copy_idx = tid * 4; // 保证 index 必定是 0, 4, 8, 12... (16字节强对齐)
+            int a_row = a_copy_idx / TILE_K;
+            int a_col = a_copy_idx % TILE_K;
+
+            int g_a_r = block_row + a_row;
+            int g_a_c = k_tile_offset + a_col;
+
+            bool valid_A = (g_a_r < M) && (g_a_c + 3 < K); // 确保连续 4 个 float 不越界
+            const float* ptr_A = gmem_A + g_a_r * K + g_a_c;
+
+            pipeline::cp_async_16bytes(&smem_A[stage][a_row][a_col], ptr_A, valid_A);
+        }
+
+        // --- 2. 搬运 B 矩阵 (TILE_K * TILE_N = 1024 个 float = 256 个 16-byte 块) ---
+        // 接下来的 256 个线程 (256 <= tid < 512) 专职搬运 B，每个线程搬运 4 个 float
+        if (tid >= 256 && tid < 512) {
+            int b_copy_idx = (tid - 256) * 4; // 保证 index 必定是 0, 4, 8, 12... (16字节强对齐)
+            int b_row = b_copy_idx / TILE_N;
+            int b_col = b_copy_idx % TILE_N;
+
+            int g_b_r = k_tile_offset + b_row;
+            int g_b_c = block_col + b_col;
+
+            bool valid_B = (g_b_r < K) && (g_b_c + 3 < N); // 确保连续 4 个 float 不越界
+            const float* ptr_B = gmem_B + g_b_r * N + g_b_c;
+
+            pipeline::cp_async_16bytes(&smem_B[stage][b_row][b_col], ptr_B, valid_B);
+        }
+    };
+
+    // =========================================================================
     // 【Phase 1: Prologue 前导预取】加载第 0 块数据到 smem[*][0]
     // =========================================================================
-    int k_offset = 0;
-    
-    // A 矩阵全局指针与 Guard (以 16 字节对齐考虑，这里演示元素级安全 Guard)
-    bool valid_A_0 = (global_a_row < M) && (k_offset + tx < K);
-    const float* ptr_A_0 = gmem_A + global_a_row * K + (k_offset + tx);
-    pipeline::cp_async_16bytes(&smem_A[write_stage][ty][tx], ptr_A_0, valid_A_0);
-
-    // B 矩阵全局指针与 Guard
-    bool valid_B_0 = (k_offset + ty < K) && (global_b_col < N);
-    const float* ptr_B_0 = gmem_B + (k_offset + ty) * N + global_b_col;
-    pipeline::cp_async_16bytes(&smem_B[write_stage][ty][tx], ptr_B_0, valid_B_0);
+    load_gmem_to_smem_async(write_stage, 0);
 
     // 提交第 0 组异步请求
     pipeline::cp_async_commit();
@@ -60,25 +90,18 @@ __global__ void async_double_buffer_pipeline_kernel(
     // 【Phase 2: Main Loop 双缓冲流水线主循环】
     // =========================================================================
     for (int tile_idx = 0; tile_idx < num_tiles - 1; ++tile_idx) {
-        // 1. 在后台异步发起【下一块 (tile_idx + 1)】数据的加载到 smem[*][write_stage]
+        // 1. 在后台异步发起【下一块 (tile_idx + 1)】数据的加载
         int next_k_offset = (tile_idx + 1) * TILE_K;
-
-        bool valid_A_next = (global_a_row < M) && (next_k_offset + tx < K);
-        const float* ptr_A_next = gmem_A + global_a_row * K + (next_k_offset + tx);
-        pipeline::cp_async_16bytes(&smem_A[write_stage][ty][tx], ptr_A_next, valid_A_next);
-
-        bool valid_B_next = (next_k_offset + ty < K) && (global_b_col < N);
-        const float* ptr_B_next = gmem_B + (next_k_offset + ty) * N + global_b_col;
-        pipeline::cp_async_16bytes(&smem_B[write_stage][ty][tx], ptr_B_next, valid_B_next);
+        load_gmem_to_smem_async(write_stage, next_k_offset);
 
         // 提交下一组请求
         pipeline::cp_async_commit();
 
-        // 2. 核心掩盖点：只等待【当前计算需要的读 Stage】(后台保持 1 组仍在异步搬运)
+        // 2. 核心掩盖点：等待上一次搬运完成
         pipeline::cp_async_wait_pending<1>();
         __syncthreads();
 
-        // 3. 执行【当前块 (tile_idx)】的矩阵计算，从 read_stage 中读取
+        // 3. 执行【当前块 (tile_idx)】的矩阵计算（逻辑完全未变！）
         int read_stage = write_stage ^ 1;
         #pragma unroll
         for (int k = 0; k < TILE_K; ++k) {
@@ -93,7 +116,6 @@ __global__ void async_double_buffer_pipeline_kernel(
     // =========================================================================
     // 【Phase 3: Epilogue 收尾阶段】处理最后一块预取好的数据
     // =========================================================================
-    // 等待所有后台任务完成
     pipeline::cp_async_wait_pending<0>();
     __syncthreads();
 
@@ -103,7 +125,7 @@ __global__ void async_double_buffer_pipeline_kernel(
         accum += smem_A[read_stage][ty][k] * smem_B[read_stage][k][tx];
     }
 
-    // 写回全局显存，带边界 Protection
+    // 写回全局显存
     if (global_a_row < M && global_b_col < N) {
         gmem_C[global_a_row * N + global_b_col] = accum;
     }
