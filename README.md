@@ -350,17 +350,22 @@ K 从 1024→2048 时增量吞吐约 **74 TFLOPS**（Δ8.59 GFLOP / Δ116 µs）
 | 流水线深度 | 无 | **2 级** | **~6 级** |
 | 同步机制 | `__syncthreads` | 每 tile 一次 `__syncthreads` | 细粒度 mbarrier |
 
-> 🔲 **贴图位置**：`docs/images/l4_compute_workload.png`
->  custom 与 cublas 的 Compute Workload Analysis 对比页
 
-> 🔲 **贴图位置**：`docs/images/l4_memory_workload.png`
-> Memory Workload Analysis，突出 Memory SOL 51.7%（L1/SMEM 层瓶颈）与 DRAM 19.6% 的分层差。
+> custom 与 cublas 的 Compute Workload Analysis 对比页
+![ custom 与 cublas 的 Compute Workload Analysis 对比页](docs/images/l4_compute_workload.png)
 
-> 🔲 **贴图位置**：`docs/images/l4_warp_state.png`
+
+> Memory Workload Analysis，突出 Memory SOL 51.7%（L1/SMEM 层瓶颈）与 DRAM 19.6% 的分层差
+![Memory Workload Analysis，突出 Memory SOL 51.7%（L1/SMEM 层瓶颈）与 DRAM 19.6% 的分层差](docs/images/l4_memory_workload.png)
+
+
 > Warp State Statistics / Warp Stall Reasons 的条形对比，突出 `stall_math_pipe_throttle` 占比。
+![Warp State Statistics / Warp Stall Reasons 的条形对比，突出 `stall_math_pipe_throttle` 占比。](docs/images/l4_warp_state.png)
 
-> 🔲 **贴图位置**：`docs/images/l4_occupancy.png`
-> Occupancy 页：理论 vs 实际 occupancy 对比
+
+> Occupancy 页：cublas vs custom occupancy 对比
+![> Occupancy 页：cublas vs custom occupancy 对比](docs/images/l4_occupancy.png)
+
 **具体差距归因**（53.8 vs 92.9，差 42%）：
 
 1. **B 矩阵加载路径差一个量级的指令效率**（最大单项）。我的 B 走
