@@ -7,10 +7,20 @@
 #include <memory>
 #include <cuda_fp16.h>
 #include <cuda_profiler_api.h>
+#include <cublas_v2.h>
 
 // =========================================================================
-// 🌟 1. C++ RAII CUDA 资源管理 Wrapper
+// 1. C++ RAII CUDA / cuBLAS 资源管理 Wrapper
 // =========================================================================
+#define CUBLAS_CHECK(call) \
+    do { \
+        cublasStatus_t err = call; \
+        if (err != CUBLAS_STATUS_SUCCESS) { \
+            std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ << " code=" << err << std::endl; \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
 template <typename T>
 struct CudaMemoryDeleter {
     void operator()(T* ptr) const {
@@ -54,8 +64,21 @@ UniqueCudaEvent make_cuda_event() {
     return UniqueCudaEvent(event);
 }
 
+struct CublasHandleDeleter {
+    void operator()(cublasHandle_t handle) const {
+        if (handle) CUBLAS_CHECK(cublasDestroy(handle));
+    }
+};
+using UniqueCublasHandle = std::unique_ptr<std::remove_pointer<cublasHandle_t>::type, CublasHandleDeleter>;
+
+UniqueCublasHandle make_cublas_handle() {
+    cublasHandle_t handle = nullptr;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    return UniqueCublasHandle(handle);
+}
+
 // =========================================================================
-// 🌟 2. 物理级 L2 Cache 刷新机制
+// 2. 物理级 L2 Cache 刷新机制
 // =========================================================================
 class L2CacheFlusher {
 private:
@@ -87,7 +110,7 @@ public:
 };
 
 // =========================================================================
-// 🌟 3. CPU 绝对标量 Ground Truth
+// 3. CPU 绝对标量 Ground Truth & Baseline Launchers
 // =========================================================================
 void cpu_gemm_fp16_ground_truth(const std::vector<__half>& A, const std::vector<__half>& B, 
                                 std::vector<float>& C, int M, int N, int K) {
@@ -102,7 +125,6 @@ void cpu_gemm_fp16_ground_truth(const std::vector<__half>& A, const std::vector<
     }
 }
 
-// 朴素 Baseline Kernel
 __global__ void naive_bank_gemm_fp16_kernel(
     const __half* __restrict__ A, const __half* __restrict__ B, __half* __restrict__ C, 
     int M, int N, int K) {
@@ -125,8 +147,28 @@ void launch_naive_bank_gemm(const __half* d_A, const __half* d_B, __half* d_C,
     naive_bank_gemm_fp16_kernel<<<grid, block, 0, stream>>>(d_A, d_B, d_C, M, N, K);
 }
 
+// 行优先 (Row-Major) 下的 cuBLAS GEMM 封装
+// C (M x N) = A (M x K) * B (K x N)
+// 在列优先的 cuBLAS 中，等价于：C^T (N x M) = B^T (N x K) * A^T (K x M)
+void launch_cublas_gemm(cublasHandle_t handle, const __half* d_A, const __half* d_B, __half* d_C, 
+                        int M, int N, int K) {
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
+    
+    CUBLAS_CHECK(cublasHgemm(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        d_B, N,
+        d_A, K,
+        &beta,
+        d_C, N
+    ));
+}
+
 // =========================================================================
-// 4. 重构后的主程序入口
+// 4. 主程序入口
 // =========================================================================
 int main(int argc, char** argv) {
     const int warmup_iters = 5;
@@ -137,7 +179,7 @@ int main(int argc, char** argv) {
     int K = 512;
 
     std::cout << "=================================================" << std::endl;
-    std::cout << ">>> Robust & Industrial-grade Swizzle Test Harness" << std::endl;
+    std::cout << ">>> Robust & Industrial-grade GEMM Benchmark" << std::endl;
     std::cout << ">>> Matrix Shape (M x N x K): " << M << " x " << N << " x " << K << std::endl;
     std::cout << "=================================================" << std::endl;
 
@@ -147,7 +189,7 @@ int main(int argc, char** argv) {
 
     std::vector<__half> h_A(num_A);
     std::vector<__half> h_B(num_B);
-    std::vector<__half> h_C_gpu_swizzle(num_C);
+    std::vector<__half> h_C_gpu(num_C);
     std::vector<float>  h_C_cpu_truth(num_C);
 
     std::mt19937 rng(1337);
@@ -164,6 +206,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_B.get(), h_B.data(), num_B * sizeof(__half), cudaMemcpyHostToDevice));
 
     auto stream = make_cuda_stream();
+    auto cublas_handle = make_cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(cublas_handle.get(), stream.get()));
+
     L2CacheFlusher l2_flusher;
 
     // ------------------------------------------------------------------------
@@ -172,18 +217,17 @@ int main(int argc, char** argv) {
     std::cout << ">>> [1/3] 计算 CPU FP32 绝对 Ground Truth 校验基准..." << std::endl;
     cpu_gemm_fp16_ground_truth(h_A, h_B, h_C_cpu_truth, M, N, K);
 
-    std::cout << ">>> 运行 Swizzle Bank-Free GEMM 算子..." << std::endl;
+    std::cout << ">>> 校验 Swizzle Bank-Free GEMM 算子..." << std::endl;
     smem_opt::launch_swizzle_bank_free_gemm(d_A.get(), d_B.get(), d_C.get(), M, N, K, stream.get());
     CUDA_CHECK(cudaStreamSynchronize(stream.get()));
-    CUDA_CHECK(cudaMemcpy(h_C_gpu_swizzle.data(), d_C.get(), num_C * sizeof(__half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_C_gpu.data(), d_C.get(), num_C * sizeof(__half), cudaMemcpyDeviceToHost));
 
     bool pass = true;
     float max_diff = 0.0f;
     float max_rel_diff = 0.0f;
-    int error_count = 0;
 
     for (size_t i = 0; i < num_C; ++i) {
-        float gpu_val = __half2float(h_C_gpu_swizzle[i]);
+        float gpu_val = __half2float(h_C_gpu[i]);
         float cpu_val = h_C_cpu_truth[i];
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_diff = abs_diff / (std::abs(cpu_val) + 1e-5f);
@@ -191,16 +235,8 @@ int main(int argc, char** argv) {
         if (abs_diff > max_diff) max_diff = abs_diff;
         if (rel_diff > max_rel_diff) max_rel_diff = rel_diff;
 
-        // 🌟 动态双重门限，精准抵御 FP16 浮点加法顺序误差
         if (abs_diff > 0.25f && rel_diff > 0.02f) { 
-            if (error_count < 5) {
-                std::cerr << "❌ [Absolute Truth Mismatch] Index " << i 
-                          << ": GPU Swizzle=" << gpu_val 
-                          << ", CPU Ground Truth=" << cpu_val 
-                          << " (Abs Diff: " << abs_diff << ", Rel Diff: " << rel_diff * 100 << "%)" << std::endl;
-            }
             pass = false;
-            error_count++;
         }
     }
 
@@ -208,64 +244,56 @@ int main(int argc, char** argv) {
         std::cout << "❌ [FAIL] 算子逻辑错误！未能通过 CPU 绝对真值校验。" << std::endl;
         return 1; 
     }
-    std::cout << "✅ [PASS] 成功通过 CPU 绝对真值比对！Max Abs Diff: " << max_diff << ", Max Rel Diff: " << max_rel_diff * 100 << "%" << std::endl;
+    std::cout << "✅ [PASS] 成功通过 CPU 绝对真值比对！Max Abs Diff: " << max_diff << ", Max Rel Diff: " << max_rel_diff * 100 << "%\n" << std::endl;
 
     // ------------------------------------------------------------------------
-    // Step 2: 精确排除了 L2 Flush 干扰的 Cold L2-Cache Benchmarking
+    // Step 2: Cold L2-Cache Benchmarking (Naive vs Swizzle vs cuBLAS)
     // ------------------------------------------------------------------------
-    std::cout << ">>> [2/3] 正在启动真实 Cold-L2-Cache Performance Benchmark..." << std::endl;
+    std::cout << ">>> [2/3] 正在启动 Cold-L2-Cache Performance Benchmark..." << std::endl;
+
+    // Lambda 性能测试工具，严格控制变量
+    auto run_benchmark = [&](auto launch_func) -> float {
+        for (int i = 0; i < warmup_iters; ++i) {
+            l2_flusher.flush(stream.get());
+            launch_func();
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream.get()));
+
+        float total_ms = 0.0f;
+        for (int i = 0; i < bench_iters; ++i) {
+            l2_flusher.flush(stream.get()); 
+            
+            auto start = make_cuda_event();
+            auto stop  = make_cuda_event();
+
+            CUDA_CHECK(cudaEventRecord(start.get(), stream.get()));
+            launch_func();
+            CUDA_CHECK(cudaEventRecord(stop.get(), stream.get()));
+            CUDA_CHECK(cudaEventSynchronize(stop.get()));
+
+            float iter_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start.get(), stop.get()));
+            total_ms += iter_ms;
+        }
+        return total_ms / bench_iters;
+    };
 
     // 1. Benchmark Naive GEMM
-    for (int i = 0; i < warmup_iters; ++i) {
-        l2_flusher.flush(stream.get());
+    float naive_ms = run_benchmark([&]() {
         launch_naive_bank_gemm(d_A.get(), d_B.get(), d_C.get(), M, N, K, stream.get());
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream.get()));
-
-    float total_naive_ms = 0.0f;
-    for (int i = 0; i < bench_iters; ++i) {
-        l2_flusher.flush(stream.get()); 
-        
-        auto start = make_cuda_event();
-        auto stop  = make_cuda_event();
-        
-        CUDA_CHECK(cudaEventRecord(start.get(), stream.get()));
-        launch_naive_bank_gemm(d_A.get(), d_B.get(), d_C.get(), M, N, K, stream.get());
-        CUDA_CHECK(cudaEventRecord(stop.get(), stream.get()));
-        CUDA_CHECK(cudaEventSynchronize(stop.get()));
-
-        float iter_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start.get(), stop.get()));
-        total_naive_ms += iter_ms;
-    }
-    float naive_ms = total_naive_ms / bench_iters;
+    });
 
     // 2. Benchmark Swizzle Bank-Free GEMM
-    for (int i = 0; i < warmup_iters; ++i) {
-        l2_flusher.flush(stream.get());
-        smem_opt::launch_swizzle_bank_free_gemm(d_A.get(), d_B.get(), d_C.get(), M, N, K, stream.get());
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream.get()));
-
-    float total_swizzle_ms = 0.0f;
     CUDA_CHECK(cudaProfilerStart());
-    for (int i = 0; i < bench_iters; ++i) {
-        l2_flusher.flush(stream.get()); 
-        
-        auto start = make_cuda_event();
-        auto stop  = make_cuda_event();
-
-        CUDA_CHECK(cudaEventRecord(start.get(), stream.get()));
+    float swizzle_ms = run_benchmark([&]() {
         smem_opt::launch_swizzle_bank_free_gemm(d_A.get(), d_B.get(), d_C.get(), M, N, K, stream.get());
-        CUDA_CHECK(cudaEventRecord(stop.get(), stream.get()));
-        CUDA_CHECK(cudaEventSynchronize(stop.get()));
-
-        float iter_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start.get(), stop.get()));
-        total_swizzle_ms += iter_ms;
-    }
+    });
     CUDA_CHECK(cudaProfilerStop());
-    float swizzle_ms = total_swizzle_ms / bench_iters;
+
+    // 3. Benchmark cuBLAS HGEMM
+    float cublas_ms = run_benchmark([&]() {
+        launch_cublas_gemm(cublas_handle.get(), d_A.get(), d_B.get(), d_C.get(), M, N, K);
+    });
 
     // ------------------------------------------------------------------------
     // Step 3: 指标计算与格式化输出
@@ -273,13 +301,16 @@ int main(int argc, char** argv) {
     double total_flops = 2.0 * static_cast<double>(M) * N * K;
     double naive_tflops = (total_flops / (naive_ms / 1000.0)) / 1e12;
     double swizzle_tflops = (total_flops / (swizzle_ms / 1000.0)) / 1e12;
-    float speedup = naive_ms / swizzle_ms;
+    double cublas_tflops = (total_flops / (cublas_ms / 1000.0)) / 1e12;
 
     std::cout << "\n==================== BENCHMARK RESULTS (COLD L2 CACHE) ====================" << std::endl;
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "Naive (Bank Conflict) Time : " << naive_ms << " ms (" << naive_tflops << " TFLOPS)" << std::endl;
     std::cout << "Swizzle (Bank-Free) Time   : " << swizzle_ms << " ms (" << swizzle_tflops << " TFLOPS)" << std::endl;
-    std::cout << "Real DRAM Speedup          : " << speedup << " x" << std::endl;
+    std::cout << "cuBLAS HGEMM Time          : " << cublas_ms << " ms (" << cublas_tflops << " TFLOPS)" << std::endl;
+    std::cout << "--------------------------------------------------------------------------" << std::endl;
+    std::cout << "Swizzle vs Naive Speedup   : " << (naive_ms / swizzle_ms) << " x" << std::endl;
+    std::cout << "cuBLAS Efficiency Reached  : " << (swizzle_tflops / cublas_tflops * 100.0) << " %" << std::endl;
     std::cout << "==========================================================================" << std::endl;
 
     return 0;

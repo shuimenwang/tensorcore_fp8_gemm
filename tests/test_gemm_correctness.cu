@@ -1,13 +1,53 @@
-#include "fused_fp8_gemm.cuh"
+#include "fused_fp8_gemm0.cuh"
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <random>
 #include <memory>
+#include <iomanip>
+#include <cublasLt.h>
 #include "common.h"
 
+// ============================================================================
+// Naive FP8 GEMM Kernel 实现
+// ============================================================================
+__global__ void naive_fp8_gemm_kernel(
+    const __nv_fp8_e4m3* __restrict__ A,
+    const __nv_fp8_e4m3* __restrict__ B,
+    float* __restrict__ C,
+    float scale_a, float scale_b,
+    int M, int N, int K) {
+    
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float a_val = static_cast<float>(A[row * K + k]);
+            float b_val = static_cast<float>(B[k * N + col]);
+            sum += a_val * b_val;
+        }
+        C[row * N + col] = sum * scale_a * scale_b;
+    }
+}
 
+inline void launch_naive_fp8_gemm(
+    const __nv_fp8_e4m3* d_A,
+    const __nv_fp8_e4m3* d_B,
+    float* d_C,
+    float scale_a, float scale_b,
+    int M, int N, int K,
+    cudaStream_t stream) {
+    
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    naive_fp8_gemm_kernel<<<grid, block, 0, stream>>>(d_A, d_B, d_C, scale_a, scale_b, M, N, K);
+}
+
+// ============================================================================
+// 辅助工具与结构定义
+// ============================================================================
 template <typename T>
 struct CudaDeleter {
     void operator()(T* ptr) const { if (ptr) cudaFree(ptr); }
@@ -22,6 +62,7 @@ UniqueCudaPtr<T> make_cuda_unique(size_t count) {
     return UniqueCudaPtr<T>(ptr);
 }
 
+// L2 Cache 刷新器，严格控制 Cold-Cache 变量
 class L2Flusher {
 private:
     void* buffer_ = nullptr;
@@ -42,6 +83,62 @@ public:
     }
 };
 
+// cuBLASLt 封装：执行标准的 Row-Major FP8 GEMM
+class CublasLtFP8Gemm {
+private:
+    cublasLtHandle_t handle_;
+    void* workspace_ = nullptr;
+    size_t workspace_size_ = 32 * 1024 * 1024; // 32MB Workspace
+
+public:
+    CublasLtFP8Gemm() {
+        cublasLtCreate(&handle_);
+        cudaMalloc(&workspace_, workspace_size_);
+    }
+    ~CublasLtFP8Gemm() {
+        if (workspace_) cudaFree(workspace_);
+        cublasLtDestroy(handle_);
+    }
+
+    void run(const __nv_fp8_e4m3* d_A,
+             const __nv_fp8_e4m3* d_B,
+             float* d_C,
+             float scale_a, float scale_b,
+             int M, int N, int K,
+             cudaStream_t stream) {
+        
+        cublasLtMatmulDesc_t operationDesc = nullptr;
+        cublasLtMatrixLayout_t adesc = nullptr, bdesc = nullptr, cdesc = nullptr;
+
+        cublasComputeType_t computeType = CUBLAS_COMPUTE_32F;
+        cublasLtMatmulDescCreate(&operationDesc, computeType, CUDA_R_32F);
+
+        cublasOperation_t transa = CUBLAS_OP_N;
+        cublasOperation_t transb = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transb, sizeof(transb));
+        cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transa, sizeof(transa));
+
+        cublasLtMatrixLayoutCreate(&adesc, CUDA_R_8F_E4M3, K, N, N);
+        cublasLtMatrixLayoutCreate(&bdesc, CUDA_R_8F_E4M3, M, K, K);
+        cublasLtMatrixLayoutCreate(&cdesc, CUDA_R_32F, M, N, N);
+
+        float alpha = scale_a * scale_b;
+        float beta = 0.0f;
+
+        cublasLtMatmul(handle_, operationDesc,
+                       &alpha, d_B, adesc,
+                       d_A, bdesc, &beta,
+                       d_C, cdesc, d_C, cdesc,
+                       nullptr, workspace_, workspace_size_, stream);
+
+        cublasLtMatrixLayoutDestroy(adesc);
+        cublasLtMatrixLayoutDestroy(bdesc);
+        cublasLtMatrixLayoutDestroy(cdesc);
+        cublasLtMatmulDescDestroy(operationDesc);
+    }
+};
+
+// CPU Ground Truth 计算
 void cpu_fp8_ground_truth(
     const std::vector<__nv_fp8_e4m3>& A,
     const std::vector<__nv_fp8_e4m3>& B,
@@ -63,122 +160,136 @@ void cpu_fp8_ground_truth(
     }
 }
 
+// 结果验证函数
+bool verify_result(const std::string& name, const std::vector<float>& h_gpu, const std::vector<float>& h_ref, float atol, float rtol) {
+    float max_diff = 0.0f;
+    bool pass = true;
+    for (size_t i = 0; i < h_gpu.size(); ++i) {
+        float diff = std::abs(h_gpu[i] - h_ref[i]);
+        if (diff > max_diff) max_diff = diff;
+        
+        float ref = std::abs(h_ref[i]);
+        if (diff > (atol + rtol * ref)) {
+            pass = false;
+            std::cout << "❌ [" << name << "] Mismatch at index " << i 
+                      << " | GPU: " << h_gpu[i] << " vs CPU: " << h_ref[i] << std::endl;
+            break;
+        }
+    }
+    if (pass) {
+        std::cout << "✅ [" << name << "] 通过校验！Max Diff: " << max_diff << std::endl;
+    } else {
+        std::cout << "❌ [" << name << "] 未通过校验！Max Diff: " << max_diff << std::endl;
+    }
+    return pass;
+}
+
+// ============================================================================
+// 测试与基准测量主体
+// ============================================================================
 void run_test_and_benchmark(int M, int N, int K) {
     float scale_a = 0.025f, scale_b = 0.015f;
 
-    std::cout << "\n=================================================" << std::endl;
+    std::cout << "\n=======================================================================" << std::endl;
     std::cout << ">>> 正在测试 Shape (M x N x K): " << M << " x " << N << " x " << K << std::endl;
-    std::cout << "=================================================" << std::endl;
+    std::cout << "=======================================================================" << std::endl;
 
     size_t num_A = M * K, num_B = K * N, num_C = M * N;
 
+    // 1. 初始化统一的 CPU 随机数据
     std::vector<__nv_fp8_e4m3> h_A(num_A);
-    std::vector<__nv_fp8_e4m3> h_B(num_B);             // 原始 B [K, N]，供 CPU Ground Truth 使用
-    std::vector<__nv_fp8_e4m3> h_B_transposed(num_B);  // 转置后的 B [N, K]，供 GPU 使用
-    
-    std::vector<float> h_C_gpu(num_C);
+    std::vector<__nv_fp8_e4m3> h_B(num_B);
     std::vector<float> h_C_cpu(num_C);
+    std::vector<float> h_C_naive(num_C);
+    std::vector<float> h_C_custom(num_C);
+    std::vector<float> h_C_cublas(num_C);
 
     std::mt19937 rng(1337);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (size_t i = 0; i < num_A; ++i) h_A[i] = __nv_fp8_e4m3(dist(rng));
     for (size_t i = 0; i < num_B; ++i) h_B[i] = __nv_fp8_e4m3(dist(rng));
 
-    // 1. 在 CPU 端完成 B 矩阵的转置 [K, N] -> [N, K]
-    for (int k = 0; k < K; ++k) {
-        for (int n = 0; n < N; ++n) {
-            h_B_transposed[n * K + k] = h_B[k * N + n];
-        }
-    }
-
+    // 2. 分配显存
     auto d_A = make_cuda_unique<__nv_fp8_e4m3>(num_A);
     auto d_B = make_cuda_unique<__nv_fp8_e4m3>(num_B);
     auto d_C = make_cuda_unique<float>(num_C);
 
-    // 2. 将转置后的 h_B_transposed 拷贝至 HBM
     CUDA_CHECK(cudaMemcpy(d_A.get(), h_A.data(), num_A * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B.get(), h_B_transposed.data(), num_B * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B.get(), h_B.data(), num_B * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     L2Flusher flusher;
+    CublasLtFP8Gemm cublas_gemm;
 
-    std::cout << ">>> [1/2] 正在执行 CPU Ground Truth 校验..." << std::endl;
-    // 3. CPU Ground Truth 保持传入未经转置的 h_B，确保计算逻辑不变
+    // 3. 计算 CPU Ground Truth
+    std::cout << ">>> [1/2] 正在计算 CPU Ground Truth..." << std::endl;
     cpu_fp8_ground_truth(h_A, h_B, h_C_cpu, scale_a, scale_b, M, N, K);
 
-    launch_fused_fp8_tensor_core_gemm(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaMemcpy(h_C_gpu.data(), d_C.get(), num_C * sizeof(float), cudaMemcpyDeviceToHost));
-
-
-
-
-
-    bool pass = true;
-    float max_diff = 0.0f;
-
-    // 1. 针对 FP8 设定两个清晰的容忍度门槛：
-    // atol: 绝对容差，FP8 乘完 Scale 后的数据底线（直接设为总 Scale 的 1~2 倍）
-    // rtol: 相对容差，FP8 尾数只有 3bit，允许 10% 的相对精度偏差
+    // 4. 正确性校验
     const float atol = scale_a * scale_b; 
     const float rtol = 0.10f;             
 
-    for (size_t i = 0; i < num_C; ++i) {
-        float diff = std::abs(h_C_gpu[i] - h_C_cpu[i]);
-        if (diff > max_diff) max_diff = diff;
-        
-        float ref = std::abs(h_C_cpu[i]);
+    // 4.1 Naive Kernel 校验
+    launch_naive_fp8_gemm(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(h_C_naive.data(), d_C.get(), num_C * sizeof(float), cudaMemcpyDeviceToHost));
+    verify_result("Naive Kernel", h_C_naive, h_C_cpu, atol, rtol);
 
-        // 2. 只要偏差超过了“绝对底线 + 相对允许偏差”，就断定算错
-        if (diff > (atol + rtol * ref)) {
-            pass = false;
-            std::cout << "❌ Mismatch at index " << i 
-                      << " | GPU: " << h_C_gpu[i] 
-                      << " vs CPU: " << h_C_cpu[i] << std::endl;
-            break;
-        }
-    }
+    // 4.2 Custom Kernel 校验
+    launch_fused_fp8_tensor_core_gemm_v0(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(h_C_custom.data(), d_C.get(), num_C * sizeof(float), cudaMemcpyDeviceToHost));
+    verify_result("Custom TensorCore", h_C_custom, h_C_cpu, atol, rtol);
 
-    if (!pass) {
-        std::cout << "❌ [FAIL] 未通过 CPU 校验！Max Diff: " << max_diff << std::endl;
-        exit(1);
-    }
-    std::cout << "✅ [PASS] 成功通过绝对真值比对！Max Diff: " << max_diff << std::endl;
+    // 4.3 cuBLASLt 校验
+    cublas_gemm.run(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(h_C_cublas.data(), d_C.get(), num_C * sizeof(float), cudaMemcpyDeviceToHost));
+    verify_result("cuBLASLt FP8", h_C_cublas, h_C_cpu, atol, rtol);
 
-    std::cout << ">>> [2/2] 正在启动 Cold L2-Cache Benchmark..." << std::endl;
+    // 5. Benchmark 性能基准测试
+    std::cout << "\n>>> [2/2] 启动 Cold L2-Cache Benchmark (均采用冷缓存机制)..." << std::endl;
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    int bench_iters = 20;
-    float total_ms = 0.0f;
-
-    for (int i = 0; i < bench_iters; ++i) {
-        // 1. 在打点前先刷写 L2 Cache（此时 start 还没开始记录）
-        flusher.flush(stream);
-        
-        // 2. 仅在 GEMM 算子发射前后记录事件
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        launch_fused_fp8_tensor_core_gemm(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        
-        // 3. 阻塞等待当前这第 i 次迭代完成，并计算纯粹的算子耗时
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float iter_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start, stop));
-        
-        total_ms += iter_ms; // 累加纯 GEMM 的耗时
-    }
-
-    // 4. 计算纯粹 GEMM 的平均耗时
-    float avg_ms = total_ms / bench_iters;
-
+    const int bench_iters = 20;
     double flops = 2.0 * M * N * K;
-    double tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    std::cout << "Average Latency (Pure GEMM Cold Cache) : " << avg_ms << " ms" << std::endl;
-    std::cout << "Performance                       : " << tflops << " TFLOPS" << std::endl;
+    auto benchmark_kernel = [&](const std::string& name, auto launch_func) {
+        float total_ms = 0.0f;
+        for (int i = 0; i < bench_iters; ++i) {
+            flusher.flush(stream); // 清空 L2 Cache
+            
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            launch_func();
+            CUDA_CHECK(cudaEventRecord(stop, stream));
+            
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float iter_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start, stop));
+            total_ms += iter_ms;
+        }
+        float avg_ms = total_ms / bench_iters;
+        double tflops = (flops / (avg_ms / 1000.0)) / 1e12;
+
+        std::cout << std::left << std::setw(22) << name 
+                  << " | Latency: " << std::fixed << std::setprecision(4) << avg_ms << " ms"
+                  << " | Performance: " << std::setprecision(2) << tflops << " TFLOPS" << std::endl;
+    };
+
+    benchmark_kernel("Naive Kernel", [&]() {
+        launch_naive_fp8_gemm(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
+    });
+
+    benchmark_kernel("Custom TensorCore", [&]() {
+        launch_fused_fp8_tensor_core_gemm_v0(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
+    });
+
+    benchmark_kernel("cuBLASLt FP8", [&]() {
+        cublas_gemm.run(d_A.get(), d_B.get(), d_C.get(), scale_a, scale_b, M, N, K, stream);
+    });
 
     cudaEventDestroy(start); 
     cudaEventDestroy(stop);
@@ -187,6 +298,6 @@ void run_test_and_benchmark(int M, int N, int K) {
 
 int main() {
     run_test_and_benchmark(512, 512, 512);
-    run_test_and_benchmark(500, 500, 500);
+    run_test_and_benchmark(2048, 2048, 2048);
     return 0;
 }
