@@ -1,4 +1,4 @@
-# 从 1.1 到 59.3 TFLOPS：一个数学系本科生的 FP8 Tensor Core GEMM 手写之路
+# 从 1.1 到 59.3 TFLOPS：一个数学系本科生的 FP8 Tensor Core GEMM 优化实现之路
 
 > 本项目从零手写 CUDA FP8 GEMM 算子，最终达到 **59.3 TFLOPS**（RTX 5060，2048³ 矩阵），
 > 为 **cuBLASLt FP8 官方算子的 53.5%**，相对朴素 CUDA 实现加速约 **55 倍**。
